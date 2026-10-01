@@ -239,9 +239,11 @@ async def handle_media_stream(websocket: WebSocket):
                                     pass
                                 return
 
-                    # Trigger an interruption. Your use case might work better using `input_audio_buffer.speech_stopped`, or combining the two.
-                    if response.get('type') == 'input_audio_buffer.speech_started':
-                        print("Speech started detected.")
+                    # Trigger an interruption only on sustained caller speech, not every
+                    # speech_started blip - phone-line noise and echo fire this constantly.
+                    if response.get('type') == 'input_audio_buffer.speech_stopped':
+                        audio_end = response.get('audio_end_ms')
+                        print(f"Speech stopped detected at {audio_end}ms.")
                         if last_assistant_item:
                             print(f"Interrupting response with id: {last_assistant_item}")
                             await handle_speech_started_event()
@@ -325,7 +327,12 @@ async def initialize_session(openai_ws, call_context_text: str = ""):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
-                    "turn_detection": {"type": "server_vad"}
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.7,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 700
+                    }
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
