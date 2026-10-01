@@ -152,6 +152,64 @@ async def handle_media_stream(websocket: WebSocket):
         mark_queue = []
         response_start_timestamp_twilio = None
         session_ready = asyncio.Event()
+        # Inactivity watchdog state: if the line is silent for too long (dead air
+        # after an interrupted turn, or the driver listening quietly), Emily
+        # re-engages instead of the call dying in silence.
+        last_activity_ts = asyncio.get_event_loop().time()
+        inactivity_nudges = 0
+        response_in_progress = False
+        inactivity_timeout = 12.0  # seconds of dead air before Emily nudges
+        max_inactivity_nudges = 2  # after the 2nd unanswered nudge she wraps up
+
+        def note_activity():
+            nonlocal last_activity_ts, inactivity_nudges
+            last_activity_ts = asyncio.get_event_loop().time()
+
+        async def inactivity_watchdog():
+            """Keep the call alive: if nobody speaks for a while, Emily checks in;
+            if the driver stays silent after nudges, she wraps up and hangs up."""
+            nonlocal inactivity_nudges, response_in_progress
+            try:
+                while True:
+                    await asyncio.sleep(1)
+                    if not session_ready.is_set() or response_in_progress:
+                        continue
+                    silent_for = asyncio.get_event_loop().time() - last_activity_ts
+                    if silent_for < inactivity_timeout:
+                        continue
+                    inactivity_nudges += 1
+                    print(f"Inactivity watchdog: {silent_for:.0f}s of silence, nudge {inactivity_nudges}")
+                    if inactivity_nudges <= max_inactivity_nudges:
+                        prompt_text = (
+                            "[system: the driver has been silent for a while. In ONE short sentence, "
+                            "politely check they are still there and re-ask your last question, for example "
+                            "'Hello, are you still there?' Do not repeat the whole offer.]"
+                        )
+                    else:
+                        prompt_text = (
+                            "[system: the driver has stayed silent after repeated attempts. Say one short "
+                            "polite closing sentence (for example 'I seem to have lost you - we will call "
+                            "back another time. Goodbye.'), then use end_call.]"
+                        )
+                    try:
+                        await openai_ws.send(json.dumps({
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": prompt_text}]
+                            }
+                        }))
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                    except Exception as e:
+                        print(f"Inactivity watchdog failed to send nudge: {e}")
+                    note_activity()
+                    if inactivity_nudges > max_inactivity_nudges:
+                        # Give her the closing sentence, then the watchdog's job is done
+                        await asyncio.sleep(inactivity_timeout)
+                        return
+            except asyncio.CancelledError:
+                pass
 
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
@@ -187,7 +245,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio
+            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, response_in_progress
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -195,6 +253,8 @@ async def handle_media_stream(websocket: WebSocket):
                         print(f"Received event: {response['type']}", response)
 
                     if response.get('type') == 'response.output_audio.delta' and 'delta' in response:
+                        response_in_progress = True
+                        note_activity()
                         audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
                         audio_delta = {
                             "event": "media",
@@ -216,6 +276,8 @@ async def handle_media_stream(websocket: WebSocket):
 
                     # Emily asked to hang up: answer her tool call, then close the line
                     if response.get('type') == 'response.done':
+                        response_in_progress = False
+                        note_activity()
                         for out_item in (response.get('response', {}).get('output') or []):
                             if out_item.get('type') == 'function_call' and out_item.get('name') == 'end_call':
                                 call_id = out_item.get('call_id')
@@ -239,9 +301,14 @@ async def handle_media_stream(websocket: WebSocket):
                                     pass
                                 return
 
+                    if response.get('type') == 'input_audio_buffer.speech_started':
+                        # Caller is speaking: reset the silence watchdog
+                        note_activity()
+
                     # Trigger an interruption only on sustained caller speech, not every
                     # speech_started blip - phone-line noise and echo fire this constantly.
                     if response.get('type') == 'input_audio_buffer.speech_stopped':
+                        note_activity()
                         audio_end = response.get('audio_end_ms')
                         print(f"Speech stopped detected at {audio_end}ms.")
                         if last_assistant_item:
@@ -290,7 +357,7 @@ async def handle_media_stream(websocket: WebSocket):
                 await connection.send_json(mark_event)
                 mark_queue.append('responsePart')
 
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
+        await asyncio.gather(receive_from_twilio(), send_to_twilio(), inactivity_watchdog())
 
 async def send_initial_conversation_item(openai_ws, call_context_text: str):
     """Send initial conversation item so Emily greets the driver first, with per-call context."""
