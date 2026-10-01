@@ -94,6 +94,29 @@ async def handle_incoming_call(request: Request):
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
+def build_call_context(call_context: dict) -> str:
+    """Turn the per-call parameters into a briefing line for Emily."""
+    driver = call_context.get('driver', '').strip()
+    reg = call_context.get('reg', '').strip()
+    advert = call_context.get('advert', '').strip()
+    slots = call_context.get('slots', '').strip()
+    parts = ["Per-call details for this specific call (use these, never invent others):"]
+    if driver:
+        parts.append(f"- Driver name: {driver}. Greet them by first name.")
+    else:
+        parts.append("- Driver name unknown. Ask who you are speaking with.")
+    if reg:
+        parts.append(f"- Taxi registration to verify: {reg}.")
+    else:
+        parts.append("- No registration supplied. Ask the driver to confirm their taxi registration.")
+    if advert:
+        parts.append(f"- Their current (expired) advert/campaign: {advert}.")
+    if slots:
+        parts.append(f"- Available fitting slots for this driver (offer ALL of these, and ONLY these): {slots}.")
+    else:
+        parts.append("- NO available slots for this call. Follow the NO SLOTS rule: offer nothing.")
+    return "\n".join(parts)
+
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     """Handle WebSocket connections between Twilio and OpenAI."""
@@ -106,7 +129,9 @@ async def handle_media_stream(websocket: WebSocket):
             "Authorization": f"Bearer {OPENAI_API_KEY}"
         }
     ) as openai_ws:
-        await initialize_session(openai_ws)
+        # Per-call context arrives as <Parameter> entries on the Twilio stream
+        # 'start' event; we initialise the OpenAI session only after reading it.
+        call_context = {}
 
         # Connection specific state
         stream_sid = None
@@ -114,10 +139,11 @@ async def handle_media_stream(websocket: WebSocket):
         last_assistant_item = None
         mark_queue = []
         response_start_timestamp_twilio = None
+        session_ready = asyncio.Event()
 
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid, latest_media_timestamp
+            nonlocal stream_sid, latest_media_timestamp, last_assistant_item, response_start_timestamp_twilio
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -130,10 +156,15 @@ async def handle_media_stream(websocket: WebSocket):
                         await openai_ws.send(json.dumps(audio_append))
                     elif data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
-                        print(f"Incoming stream has started {stream_sid}")
+                        custom = data['start'].get('customParameters', {}) or {}
+                        call_context.update(custom)
+                        print(f"Incoming stream has started {stream_sid} with context {call_context}")
                         response_start_timestamp_twilio = None
                         latest_media_timestamp = 0
                         last_assistant_item = None
+                        if not session_ready.is_set():
+                            await initialize_session(openai_ws, build_call_context(call_context))
+                            session_ready.set()
                     elif data['event'] == 'mark':
                         if mark_queue:
                             mark_queue.pop(0)
@@ -222,8 +253,8 @@ async def handle_media_stream(websocket: WebSocket):
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
-async def send_initial_conversation_item(openai_ws):
-    """Send initial conversation item so Emily greets the driver first."""
+async def send_initial_conversation_item(openai_ws, call_context_text: str):
+    """Send initial conversation item so Emily greets the driver first, with per-call context."""
     initial_conversation_item = {
         "type": "conversation.item.create",
         "item": {
@@ -232,7 +263,12 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Start the call now: greet the driver with the time-of-day greeting and introduce yourself as Emily Smith calling from Sherbet Electric Taxis, London, then ask to verify the taxi registration."
+                    "text": (
+                        call_context_text
+                        + "\n\nStart the call now: greet the driver with the time-of-day greeting and "
+                        "introduce yourself as Emily Smith calling from Sherbet Electric Taxis, London, "
+                        "then ask to verify the taxi registration."
+                    )
                 }
             ]
         }
@@ -241,7 +277,7 @@ async def send_initial_conversation_item(openai_ws):
     await openai_ws.send(json.dumps({"type": "response.create"}))
 
 
-async def initialize_session(openai_ws):
+async def initialize_session(openai_ws, call_context_text: str = ""):
     """Control initial session with OpenAI."""
     session_update = {
         "type": "session.update",
@@ -266,7 +302,7 @@ async def initialize_session(openai_ws):
     await openai_ws.send(json.dumps(session_update))
 
     # Emily speaks first when the call connects
-    await send_initial_conversation_item(openai_ws)
+    await send_initial_conversation_item(openai_ws, call_context_text)
 
 if __name__ == "__main__":
     import uvicorn
