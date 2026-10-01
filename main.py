@@ -61,6 +61,10 @@ SYSTEM_MESSAGE = (
     "If none of the offered slots suit the driver, apologise, tell them we will call back another time with "
     "more dates, and treat the outcome as 'callback requested'. "
     "If the driver declines the advert change entirely, accept gracefully and treat the outcome as 'declined'. "
+    "ENDING THE CALL: When the conversation is finished, say ONE short goodbye and then immediately use the "
+    "end_call tool to hang up. Never say goodbye more than once, and never keep talking after your final "
+    "goodbye - call end_call straight away. Also use end_call if the driver hangs up, is silent for a long "
+    "time, or asks you to stop calling. "
     "Keep your responses short, natural, and conversational - this is a phone call. Never invent dates, times, "
     "or locations; only offer slots from the list given to you. Never ask for payment, personal documents, or "
     "any details beyond confirming the registration and the chosen slot. Always speak in a clear, warm British "
@@ -202,6 +206,26 @@ async def handle_media_stream(websocket: WebSocket):
 
                         await send_mark(websocket, stream_sid)
 
+                    # Emily asked to hang up: answer her tool call, then close the line
+                    if response.get('type') == 'response.done':
+                        for out_item in (response.get('response', {}).get('output') or []):
+                            if out_item.get('type') == 'function_call' and out_item.get('name') == 'end_call':
+                                call_id = out_item.get('call_id')
+                                print(f"Emily requested hangup: {call_id}")
+                                try:
+                                    await openai_ws.send(json.dumps({
+                                        "type": "conversation.item.create",
+                                        "item": {
+                                            "type": "function_call_output",
+                                            "call_id": call_id,
+                                            "output": json.dumps({"ok": True})
+                                        }
+                                    }))
+                                except Exception:
+                                    pass
+                                await websocket.close()
+                                return
+
                     # Trigger an interruption. Your use case might work better using `input_audio_buffer.speech_stopped`, or combining the two.
                     if response.get('type') == 'input_audio_buffer.speech_started':
                         print("Speech started detected.")
@@ -296,6 +320,13 @@ async def initialize_session(openai_ws, call_context_text: str = ""):
                 }
             },
             "instructions": SYSTEM_MESSAGE,
+            "tools": [{
+                "type": "function",
+                "name": "end_call",
+                "description": "Hang up the phone call. Call this after you have said your final goodbye. It disconnects the line.",
+                "parameters": {"type": "object", "properties": {}, "required": []}
+            }],
+            "tool_choice": "auto"
         }
     }
     print('Sending session update:', json.dumps(session_update))
