@@ -53,7 +53,11 @@ SYSTEM_MESSAGE = (
     "more detail. Never invent or guess an address, date, or time. "
     "BOOKING: If the driver accepts a slot, repeat the chosen date, time, and location back to confirm it, "
     "then tell them: 'You are all booked in. We will send you a confirmation SMS shortly with the full details, "
-    "the address, and the documents you need to bring.' Thank them and end the call warmly. "
+    "the address, and the documents you need to bring.' Thank them warmly. After a booking is confirmed the "
+    "call is NOT over yet - you must still deliver your goodbye exchange as described in ENDING THE CALL: "
+    "one short closing sentence, wait for the driver's reply or a moment of silence, and only then end the "
+    "call. NEVER hang up while you are confirming the booking or immediately after the confirmation - the "
+    "driver must hear the whole confirmation and the goodbye. "
     "NO SLOTS: If no slot list was provided to you at the start of this call, you must NOT offer or mention "
     "any specific date, time, or location - not even approximately, and not at Tiago, Kew, Camden, or Frank. "
     "Instead, tell the driver we are confirming the fitting diary and will call back or text shortly with "
@@ -66,9 +70,9 @@ SYSTEM_MESSAGE = (
     "talking. Only end the call when a final outcome has been reached (booking confirmed, callback promised, "
     "declined, wrong number, or no slots available). When that happens: first say ONE short closing sentence "
     "(for example 'Thank you, have a great day, goodbye'), then WAIT for the driver's reply or a moment of "
-    "silence, and only THEN use end_call. Never use end_call in the same turn as your goodbye, and never use "
-    "it while the driver is still speaking or might respond. If the driver themselves says goodbye, reply "
-    "briefly and then use end_call. "
+    "silence, and only THEN use end_call. Never use end_call in the same turn as your goodbye or your "
+    "booking confirmation, and never use it while the driver is still speaking or might respond. If the "
+    "driver themselves says goodbye, reply briefly and then use end_call. "
     "Keep your responses short, natural, and conversational - this is a phone call. Never invent dates, times, "
     "or locations; only offer slots from the list given to you. Never ask for payment, personal documents, or "
     "any details beyond confirming the registration and the chosen slot. Always speak in a clear, warm British "
@@ -227,7 +231,12 @@ async def handle_media_stream(websocket: WebSocket):
                                     }))
                                 except Exception:
                                     pass
-                                await websocket.close()
+                                # Let any queued audio finish playing on the line before hanging up
+                                await asyncio.sleep(3)
+                                try:
+                                    await websocket.close()
+                                except Exception:
+                                    pass
                                 return
 
                     # Trigger an interruption. Your use case might work better using `input_audio_buffer.speech_stopped`, or combining the two.
@@ -327,7 +336,7 @@ async def initialize_session(openai_ws, call_context_text: str = ""):
             "tools": [{
                 "type": "function",
                 "name": "end_call",
-                "description": "Hang up the phone call. Call this only after you have said your final goodbye AND the driver has replied or gone quiet. It disconnects the line instantly.",
+                "description": "Hang up the phone call. Call this after you have said your final goodbye. It disconnects the line.",
                 "parameters": {"type": "object", "properties": {}, "required": []}
             }],
             "tool_choice": "auto"
