@@ -62,6 +62,12 @@ SYSTEM_MESSAGE = (
     "any specific date, time, or location - not even approximately, and not at Tiago, Kew, Camden, or Frank. "
     "Instead, tell the driver we are confirming the fitting diary and will call back or text shortly with "
     "dates, and treat the outcome as 'no slots available'. "
+    "BOOKING CLOSE-OUT (mandatory, every time a slot is confirmed): after the driver accepts a slot, you "
+    "MUST say ALL of the following, in order, before the call ends: (1) repeat the chosen date, time, and "
+    "location to confirm it; (2) 'You are all booked in. We will send you a confirmation SMS shortly with the "
+    "full details, the address, and the documents you need to bring.'; (3) thank them warmly; (4) one short "
+    "closing sentence and goodbye. Never confirm a slot and then fall silent or hang up - the confirmation "
+    "SMS promise and the goodbye are part of every booking. "
     "If none of the offered slots suit the driver, apologise, tell them we will call back another time with "
     "more dates, and treat the outcome as 'callback requested'. "
     "If the driver declines the advert change entirely, accept gracefully and treat the outcome as 'declined'. "
@@ -158,6 +164,7 @@ async def handle_media_stream(websocket: WebSocket):
         last_activity_ts = asyncio.get_event_loop().time()
         inactivity_nudges = 0
         response_in_progress = False
+        caller_speaking = False
         inactivity_timeout = 12.0  # seconds of dead air before Emily nudges
         max_inactivity_nudges = 2  # after the 2nd unanswered nudge she wraps up
 
@@ -167,12 +174,14 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def inactivity_watchdog():
             """Keep the call alive: if nobody speaks for a while, Emily checks in;
-            if the driver stays silent after nudges, she wraps up and hangs up."""
+            if the driver stays silent after nudges, she wraps up and hangs up.
+            The watchdog NEVER fires while Emily is generating or playing audio or
+            while the caller is speaking - a nudge must never talk over anyone."""
             nonlocal inactivity_nudges, response_in_progress
             try:
                 while True:
                     await asyncio.sleep(1)
-                    if not session_ready.is_set() or response_in_progress:
+                    if not session_ready.is_set() or response_in_progress or caller_speaking:
                         continue
                     silent_for = asyncio.get_event_loop().time() - last_activity_ts
                     if silent_for < inactivity_timeout:
@@ -245,7 +254,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, response_in_progress
+            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, response_in_progress, caller_speaking
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -302,12 +311,14 @@ async def handle_media_stream(websocket: WebSocket):
                                 return
 
                     if response.get('type') == 'input_audio_buffer.speech_started':
-                        # Caller is speaking: reset the silence watchdog
+                        # Caller is speaking: mark it and reset the silence watchdog
+                        caller_speaking = True
                         note_activity()
 
                     # Trigger an interruption only on sustained caller speech, not every
                     # speech_started blip - phone-line noise and echo fire this constantly.
                     if response.get('type') == 'input_audio_buffer.speech_stopped':
+                        caller_speaking = False
                         note_activity()
                         audio_end = response.get('audio_end_ms')
                         print(f"Speech stopped detected at {audio_end}ms.")
@@ -410,7 +421,7 @@ async def initialize_session(openai_ws, call_context_text: str = ""):
             "tools": [{
                 "type": "function",
                 "name": "end_call",
-                "description": "Hang up the phone call. Call this after you have said your final goodbye. It disconnects the line.",
+                "description": "Hang up the phone call. Call this ONLY after your full closing sequence: booking confirmation and SMS promise (when a slot was booked), your final goodbye sentence, and the driver's reply or a moment of silence. It disconnects the line instantly.",
                 "parameters": {"type": "object", "properties": {}, "required": []}
             }],
             "tool_choice": "auto"
