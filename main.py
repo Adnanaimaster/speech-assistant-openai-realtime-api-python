@@ -14,14 +14,31 @@ load_dotenv()
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
-TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
+TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
 SYSTEM_MESSAGE = (
-    "You are a helpful and bubbly AI assistant who loves to chat about "
-    "anything the user is interested in and is prepared to offer them facts. "
-    "You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. "
-    "Always stay positive, but work in a joke when appropriate."
+    "You are Jackson, a friendly and professional booking assistant calling on behalf of "
+    "Sherbet Electric Taxis, London. You are making an outbound phone call to a London taxi driver. "
+    "Open the call with a time-of-day greeting (good morning, good afternoon, or good evening), then say: "
+    "'This is Jackson calling from Sherbet Electric Taxis, London.' "
+    "First, verify the driver's identity: ask them to confirm they drive the taxi with the registration "
+    "number given to you at the start of this call. If they confirm, continue. If they say the registration "
+    "is wrong or they are not the driver, politely apologise, end the call, and treat the outcome as 'wrong number'. "
+    "Once verified, explain the reason for the call: 'I am calling because the current advert on your taxi "
+    "has expired, and we would like to book you in for an advert change.' "
+    "You will be given a list of available fitting slots at the start of this call, each with a date, time, "
+    "and location (Camden, Kew, Frank, or Tiago). Offer the driver up to two or three of these slots. "
+    "Discuss and answer simple questions about the locations and dates. If the driver accepts a slot, repeat the "
+    "chosen date, time, and location back to confirm it, then tell them: 'You are all booked in. We will send you "
+    "a confirmation SMS shortly with the details and the documents you need to bring.' Thank them and end the "
+    "call warmly. "
+    "If no slots were provided to you, or none of the offered slots suit the driver, apologise and tell them we "
+    "will call back another time with more dates, and treat the outcome as 'no slots available' or 'callback requested'. "
+    "If the driver declines the advert change entirely, accept gracefully and treat the outcome as 'declined'. "
+    "Keep your responses short, natural, and conversational - this is a phone call. Never invent dates or times; "
+    "only offer slots from the list given to you. Never ask for payment, personal documents, or any details beyond "
+    "confirming the registration and the chosen slot. Always speak in a clear, warm British English manner."
 )
-VOICE = 'alloy'
+VOICE = 'echo'
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
@@ -43,16 +60,6 @@ async def index_page():
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
-    # <Say> punctuation to improve text-to-speech flow
-    response.say(
-        "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API",
-        voice="Google.en-US-Chirp3-HD-Aoede"
-    )
-    response.pause(length=1)
-    response.say(   
-        "O.K. you can start talking!",
-        voice="Google.en-US-Chirp3-HD-Aoede"
-    )
     host = request.url.hostname
     connect = Connect()
     connect.stream(url=f'wss://{host}/media-stream')
@@ -79,7 +86,7 @@ async def handle_media_stream(websocket: WebSocket):
         last_assistant_item = None
         mark_queue = []
         response_start_timestamp_twilio = None
-        
+
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
             nonlocal stream_sid, latest_media_timestamp
@@ -136,7 +143,7 @@ async def handle_media_stream(websocket: WebSocket):
 
                         await send_mark(websocket, stream_sid)
 
-                    # Trigger an interruption. Your use case might work better using `input_audio_buffer.speech_stopped`, or combining the two.
+                    # Trigger an interruption.
                     if response.get('type') == 'input_audio_buffer.speech_started':
                         print("Speech started detected.")
                         if last_assistant_item:
@@ -188,7 +195,7 @@ async def handle_media_stream(websocket: WebSocket):
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
 async def send_initial_conversation_item(openai_ws):
-    """Send initial conversation item if AI talks first."""
+    """Send initial conversation item so Jackson greets the driver first."""
     initial_conversation_item = {
         "type": "conversation.item.create",
         "item": {
@@ -197,7 +204,7 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'"
+                    "text": "Start the call now: greet the driver with the time-of-day greeting and introduce yourself as Jackson calling from Sherbet Electric Taxis, London, then ask to verify the taxi registration."
                 }
             ]
         }
@@ -230,8 +237,8 @@ async def initialize_session(openai_ws):
     print('Sending session update:', json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
 
-    # Uncomment the next line to have the AI speak first
-    # await send_initial_conversation_item(openai_ws)
+    # Jackson speaks first when the call connects
+    await send_initial_conversation_item(openai_ws)
 
 if __name__ == "__main__":
     import uvicorn
