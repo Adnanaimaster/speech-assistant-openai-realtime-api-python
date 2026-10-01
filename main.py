@@ -61,10 +61,14 @@ SYSTEM_MESSAGE = (
     "If none of the offered slots suit the driver, apologise, tell them we will call back another time with "
     "more dates, and treat the outcome as 'callback requested'. "
     "If the driver declines the advert change entirely, accept gracefully and treat the outcome as 'declined'. "
-    "ENDING THE CALL: When the conversation is finished, say ONE short goodbye and then immediately use the "
-    "end_call tool to hang up. Never say goodbye more than once, and never keep talking after your final "
-    "goodbye - call end_call straight away. Also use end_call if the driver hangs up, is silent for a long "
-    "time, or asks you to stop calling. "
+    "ENDING THE CALL: end_call hangs up the phone line instantly, so it MUST be the very last thing you do. "
+    "Never use end_call in the middle of the conversation - if the driver still has something to say, keep "
+    "talking. Only end the call when a final outcome has been reached (booking confirmed, callback promised, "
+    "declined, wrong number, or no slots available). When that happens: first say ONE short closing sentence "
+    "(for example 'Thank you, have a great day, goodbye'), then WAIT for the driver's reply or a moment of "
+    "silence, and only THEN use end_call. Never use end_call in the same turn as your goodbye, and never use "
+    "it while the driver is still speaking or might respond. If the driver themselves says goodbye, reply "
+    "briefly and then use end_call. "
     "Keep your responses short, natural, and conversational - this is a phone call. Never invent dates, times, "
     "or locations; only offer slots from the list given to you. Never ask for payment, personal documents, or "
     "any details beyond confirming the registration and the chosen slot. Always speak in a clear, warm British "
@@ -323,7 +327,7 @@ async def initialize_session(openai_ws, call_context_text: str = ""):
             "tools": [{
                 "type": "function",
                 "name": "end_call",
-                "description": "Hang up the phone call. Call this after you have said your final goodbye. It disconnects the line.",
+                "description": "Hang up the phone call. Call this only after you have said your final goodbye AND the driver has replied or gone quiet. It disconnects the line instantly.",
                 "parameters": {"type": "object", "properties": {}, "required": []}
             }],
             "tool_choice": "auto"
