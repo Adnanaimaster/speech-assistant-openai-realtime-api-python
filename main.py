@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import asyncio
+import time
 import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -71,7 +72,7 @@ SYSTEM_MESSAGE = (
     "If none of the offered slots suit the driver, apologise, tell them we will call back another time with "
     "more dates, and treat the outcome as 'callback requested'. "
     "If the driver declines the advert change entirely, accept gracefully and treat the outcome as 'declined'. "
-    "ENDING THE CALL: end_call hangs up the phone line instantly, so it MUST be the very last thing you do. "
+    "ENDING THE CALL: end_call hangs up the phone line, so it MUST be the very last thing you do. "
     "Never use end_call in the middle of the conversation - if the driver still has something to say, keep "
     "talking. Only end the call when a final outcome has been reached (booking confirmed, callback promised, "
     "declined, wrong number, or no slots available). When that happens: first say ONE short closing sentence "
@@ -165,6 +166,10 @@ async def handle_media_stream(websocket: WebSocket):
         inactivity_nudges = 0
         response_in_progress = False
         caller_speaking = False
+        # Deferred hang-up state: end_call must never cut Emily's audio off.
+        end_call_requested = None      # call_id once Emily asks to hang up
+        end_call_requested_at = None   # monotonic time of the request
+        last_audio_out_at = None       # monotonic time of the last audio chunk sent to Twilio
         inactivity_timeout = 12.0  # seconds of dead air before Emily nudges
         max_inactivity_nudges = 2  # after the 2nd unanswered nudge she wraps up
 
@@ -254,7 +259,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, response_in_progress, caller_speaking
+            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, response_in_progress, caller_speaking, end_call_requested, end_call_requested_at, last_audio_out_at
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -273,6 +278,7 @@ async def handle_media_stream(websocket: WebSocket):
                             }
                         }
                         await websocket.send_json(audio_delta)
+                        last_audio_out_at = time.monotonic()
 
 
                         if response.get("item_id") and response["item_id"] != last_assistant_item:
@@ -283,32 +289,28 @@ async def handle_media_stream(websocket: WebSocket):
 
                         await send_mark(websocket, stream_sid)
 
-                    # Emily asked to hang up: answer her tool call, then close the line
                     if response.get('type') == 'response.done':
                         response_in_progress = False
                         note_activity()
+                        # Emily asked to hang up: answer her tool call, but do NOT close
+                        # the line here - her closing audio is still queued/playing. The
+                        # hangup_watcher below closes the call once playback has drained.
                         for out_item in (response.get('response', {}).get('output') or []):
-                            if out_item.get('type') == 'function_call' and out_item.get('name') == 'end_call':
-                                call_id = out_item.get('call_id')
-                                print(f"Emily requested hangup: {call_id}")
+                            if out_item.get('type') == 'function_call' and out_item.get('name') == 'end_call' and end_call_requested is None:
+                                end_call_requested = out_item.get('call_id')
+                                end_call_requested_at = time.monotonic()
+                                print(f"Emily requested hangup (deferred until audio drains): {end_call_requested}")
                                 try:
                                     await openai_ws.send(json.dumps({
                                         "type": "conversation.item.create",
                                         "item": {
                                             "type": "function_call_output",
-                                            "call_id": call_id,
+                                            "call_id": end_call_requested,
                                             "output": json.dumps({"ok": True})
                                         }
                                     }))
                                 except Exception:
                                     pass
-                                # Let any queued audio finish playing on the line before hanging up
-                                await asyncio.sleep(3)
-                                try:
-                                    await websocket.close()
-                                except Exception:
-                                    pass
-                                return
 
                     if response.get('type') == 'input_audio_buffer.speech_started':
                         # Caller is speaking: mark it and reset the silence watchdog
@@ -327,6 +329,31 @@ async def handle_media_stream(websocket: WebSocket):
                             await handle_speech_started_event()
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
+
+        async def hangup_watcher():
+            """Close the Twilio line only after Emily's final audio has finished
+            playing on the call. Audio reaches the caller ~150ms after each chunk
+            is sent, so wait for the stream to go quiet plus a drain margin.
+            end_call can arrive while her closing sentence is still being
+            generated, so also wait for any in-flight response to complete."""
+            try:
+                while True:
+                    await asyncio.sleep(0.5)
+                    if end_call_requested_at is None:
+                        continue
+                    waited = time.monotonic() - end_call_requested_at
+                    if response_in_progress:
+                        continue  # closing sentence still being generated/played
+                    quiet_for = time.monotonic() - last_audio_out_at if last_audio_out_at else 999
+                    if quiet_for >= 3.0 or waited >= 30.0:
+                        print(f"Hanging up now: audio drained (quiet {quiet_for:.1f}s, waited {waited:.1f}s)")
+                        try:
+                            await websocket.close()
+                        except Exception:
+                            pass
+                        return
+            except asyncio.CancelledError:
+                pass
 
         async def handle_speech_started_event():
             """Handle interruption when the caller's speech starts."""
@@ -368,7 +395,7 @@ async def handle_media_stream(websocket: WebSocket):
                 await connection.send_json(mark_event)
                 mark_queue.append('responsePart')
 
-        await asyncio.gather(receive_from_twilio(), send_to_twilio(), inactivity_watchdog())
+        await asyncio.gather(receive_from_twilio(), send_to_twilio(), inactivity_watchdog(), hangup_watcher())
 
 async def send_initial_conversation_item(openai_ws, call_context_text: str):
     """Send initial conversation item so Emily greets the driver first, with per-call context."""
@@ -421,7 +448,7 @@ async def initialize_session(openai_ws, call_context_text: str = ""):
             "tools": [{
                 "type": "function",
                 "name": "end_call",
-                "description": "Hang up the phone call. Call this ONLY after your full closing sequence: booking confirmation and SMS promise (when a slot was booked), your final goodbye sentence, and the driver's reply or a moment of silence. It disconnects the line instantly.",
+                "description": "Hang up the phone call. Call this ONLY after your full closing sequence: booking confirmation and SMS promise (when a slot was booked), your final goodbye sentence, and the driver's reply or a moment of silence.",
                 "parameters": {"type": "object", "properties": {}, "required": []}
             }],
             "tool_choice": "auto"
