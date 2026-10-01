@@ -16,10 +16,10 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
 SYSTEM_MESSAGE = (
-    "You are Jackson, a friendly and professional booking assistant calling on behalf of "
+    "You are Emily Smith, a friendly and professional booking assistant calling on behalf of "
     "Sherbet Electric Taxis, London. You are making an outbound phone call to a London taxi driver. "
     "Open the call with a time-of-day greeting (good morning, good afternoon, or good evening), then say: "
-    "'This is Jackson calling from Sherbet Electric Taxis, London.' "
+    "'This is Emily Smith calling from Sherbet Electric Taxis, London.' "
     "First, verify the driver's identity: ask them to confirm they drive the taxi with the registration "
     "number given to you at the start of this call. If they confirm, continue. If they say the registration "
     "is wrong or they are not the driver, politely apologise, end the call, and treat the outcome as 'wrong number'. "
@@ -51,7 +51,7 @@ SYSTEM_MESSAGE = (
     "any details beyond confirming the registration and the chosen slot. Always speak in a clear, warm British "
     "English manner."
 )
-VOICE = 'echo'
+VOICE = 'shimmer'
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
@@ -208,7 +208,7 @@ async def handle_media_stream(websocket: WebSocket):
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
 async def send_initial_conversation_item(openai_ws):
-    """Send initial conversation item so Jackson greets the driver first."""
+    """Send initial conversation item so Emily greets the driver first."""
     initial_conversation_item = {
         "type": "conversation.item.create",
         "item": {
@@ -217,7 +217,7 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Start the call now: greet the driver with the time-of-day greeting and introduce yourself as Jackson calling from Sherbet Electric Taxis, London, then ask to verify the taxi registration."
+                    "text": "Start the call now: greet the driver with the time-of-day greeting and introduce yourself as Emily Smith calling from Sherbet Electric Taxis, London, then ask to verify the taxi registration."
                 }
             ]
         }
@@ -250,7 +250,7 @@ async def initialize_session(openai_ws):
     print('Sending session update:', json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
 
-    # Jackson speaks first when the call connects
+    # Emily speaks first when the call connects
     await send_initial_conversation_item(openai_ws)
 
 if __name__ == "__main__":
