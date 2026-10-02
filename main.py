@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 import time
+import urllib.request
 import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -15,6 +16,12 @@ load_dotenv()
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
+# Where the workflow receives the call outcome once the call ends (test URL
+# until the workflow is published, then swap to the production /webhook/ URL).
+OUTCOME_WEBHOOK_URL = os.getenv(
+    'OUTCOME_WEBHOOK_URL',
+    'https://adnanakhana.app.n8n.cloud/webhook-test/jackson-call-outcome'
+)
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
 SYSTEM_MESSAGE = (
     "You are Emily Smith, a friendly and professional booking assistant calling on behalf of "
@@ -72,7 +79,7 @@ SYSTEM_MESSAGE = (
     "If none of the offered slots suit the driver, apologise, tell them we will call back another time with "
     "more dates, and treat the outcome as 'callback requested'. "
     "If the driver declines the advert change entirely, accept gracefully and treat the outcome as 'declined'. "
-    "ENDING THE CALL: end_call hangs up the phone line, so it MUST be the very last thing you do. "
+    "ENDING THE CALL: end_call hangs up the phone line instantly, so it MUST be the very last thing you do. "
     "Never use end_call in the middle of the conversation - if the driver still has something to say, keep "
     "talking. Only end the call when a final outcome has been reached (booking confirmed, callback promised, "
     "declined, wrong number, or no slots available). When that happens: first say ONE short closing sentence "
@@ -80,6 +87,15 @@ SYSTEM_MESSAGE = (
     "silence, and only THEN use end_call. Never use end_call in the same turn as your goodbye or your "
     "booking confirmation, and never use it while the driver is still speaking or might respond. If the "
     "driver themselves says goodbye, reply briefly and then use end_call. "
+    "REPORTING THE RESULT: You also have a report_outcome tool. Use it ONCE per call, the moment the final "
+    "outcome is clear (usually just before your closing sentence, or immediately if the driver hangs up on "
+    "you). Never ask the driver to wait while you use it. Arguments: outcome - exactly one of 'booked', "
+    "'declined', 'no answer', 'voicemail', 'wrong number', 'do not call', 'callback', 'failed' (use 'callback' "
+    "for a requested call-back, a human follow-up request, or when no slots were available); slot_text - "
+    "required when outcome is 'booked': copy the chosen slot EXACTLY as it appears in your slot list, in the "
+    "form 'Tiago on 5 October at 12:00'; summary - 1-3 sentences noting what the driver said, including any "
+    "request for a human call-back. report_outcome does not hang up: still do your full closing exchange and "
+    "then end_call as normal. "
     "Keep your responses short, natural, and conversational - this is a phone call. Never invent dates, times, "
     "or locations; only offer slots from the list given to you. Never ask for payment, personal documents, or "
     "any details beyond confirming the registration and the chosen slot. Always speak in a clear, warm British "
@@ -130,6 +146,8 @@ def build_call_context(call_context: dict) -> str:
         parts.append("- No registration supplied. Ask the driver to confirm their taxi registration.")
     if advert:
         parts.append(f"- Their current (expired) advert/campaign: {advert}.")
+    if call_context.get('row'):
+        parts.append(f"- Driver sheet row (internal reference, never mention on the call): {call_context['row']}.")
     if slots:
         parts.append(f"- Available fitting slots for this driver (offer ALL of these, and ONLY these): {slots}.")
     else:
@@ -170,6 +188,44 @@ async def handle_media_stream(websocket: WebSocket):
         end_call_requested = None      # call_id once Emily asks to hang up
         end_call_requested_at = None   # monotonic time of the request
         last_audio_out_at = None       # monotonic time of the last audio chunk sent to Twilio
+        # Outcome reporting state: Emily calls report_outcome once the result is
+        # clear; the transcript below is the safety net if she does not.
+        outcome_reported = None        # dict of report_outcome arguments
+        transcript_lines = []          # [(role, text), ...]
+        item_roles = {}                # item_id -> role
+
+        def post_outcome_sync(payload):
+            try:
+                req = urllib.request.Request(
+                    OUTCOME_WEBHOOK_URL,
+                    data=json.dumps(payload).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    print(f"Outcome posted to workflow: HTTP {resp.status} -> {payload.get('outcome')}")
+            except Exception as e:
+                print(f"Failed to post outcome to workflow: {e}")
+
+        async def send_call_outcome(reason):
+            nonlocal outcome_reported
+            payload = outcome_reported or {}
+            if not payload.get('outcome'):
+                # Emily never called report_outcome: build a minimal record so the
+                # call is still registered, with the transcript as the summary.
+                text = ' | '.join(t for _, t in transcript_lines[-12:])
+                payload = {
+                    'outcome': 'failed' if reason == 'error' else 'no answer',
+                    'summary': ('Call ended without a reported outcome (' + reason + '). Transcript: ' + text)[:800],
+                }
+            payload.update({
+                'row_number': call_context.get('row', ''),
+                'driver_name': call_context.get('driver', ''),
+                'phone_number': call_context.get('phone', ''),
+                'registration': call_context.get('reg', ''),
+                'advert': call_context.get('advert', ''),
+                'reason': reason,
+            })
+            await asyncio.get_event_loop().run_in_executor(None, post_outcome_sync, payload)
         inactivity_timeout = 12.0  # seconds of dead air before Emily nudges
         max_inactivity_nudges = 2  # after the 2nd unanswered nudge she wraps up
 
@@ -256,10 +312,11 @@ async def handle_media_stream(websocket: WebSocket):
                 print("Client disconnected.")
                 if openai_ws.state.name == 'OPEN':
                     await openai_ws.close()
+                await send_call_outcome('line closed')
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, response_in_progress, caller_speaking, end_call_requested, end_call_requested_at, last_audio_out_at
+            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, response_in_progress, caller_speaking
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -289,9 +346,41 @@ async def handle_media_stream(websocket: WebSocket):
 
                         await send_mark(websocket, stream_sid)
 
+                    if response.get('type') == 'conversation.item.input_audio_transcription.completed':
+                        t = (response.get('transcript') or '').strip()
+                        if t:
+                            transcript_lines.append(('driver', t))
+                            note_activity()
+
+                    if response.get('type') == 'response.output_item.done':
+                        it = response.get('item') or {}
+                        if it.get('type') == 'message' and it.get('role') == 'assistant':
+                            txt = ' '.join(c.get('transcript') or '' for c in (it.get('content') or [])).strip()
+                            if txt:
+                                transcript_lines.append(('emily', txt))
+
                     if response.get('type') == 'response.done':
                         response_in_progress = False
                         note_activity()
+                        for out_item in (response.get('response', {}).get('output') or []):
+                            if out_item.get('type') == 'function_call' and out_item.get('name') == 'report_outcome':
+                                try:
+                                    args = json.loads(out_item.get('arguments') or '{}')
+                                except Exception:
+                                    args = {}
+                                outcome_reported = args
+                                print(f"Emily reported outcome: {args.get('outcome')} slot={args.get('slot_text')!r}")
+                                try:
+                                    await openai_ws.send(json.dumps({
+                                        "type": "conversation.item.create",
+                                        "item": {
+                                            "type": "function_call_output",
+                                            "call_id": out_item.get('call_id'),
+                                            "output": json.dumps({"ok": True})
+                                        }
+                                    }))
+                                except Exception:
+                                    pass
                         # Emily asked to hang up: answer her tool call, but do NOT close
                         # the line here - her closing audio is still queued/playing. The
                         # hangup_watcher below closes the call once playback has drained.
@@ -351,6 +440,7 @@ async def handle_media_stream(websocket: WebSocket):
                             await websocket.close()
                         except Exception:
                             pass
+                        await send_call_outcome('hangup')
                         return
             except asyncio.CancelledError:
                 pass
@@ -448,8 +538,21 @@ async def initialize_session(openai_ws, call_context_text: str = ""):
             "tools": [{
                 "type": "function",
                 "name": "end_call",
-                "description": "Hang up the phone call. Call this ONLY after your full closing sequence: booking confirmation and SMS promise (when a slot was booked), your final goodbye sentence, and the driver's reply or a moment of silence.",
+                "description": "Hang up the phone call. Call this ONLY after your full closing sequence: booking confirmation and SMS promise (when a slot was booked), your final goodbye sentence, and the driver's reply or a moment of silence. It disconnects the line instantly.",
                 "parameters": {"type": "object", "properties": {}, "required": []}
+            }, {
+                "type": "function",
+                "name": "report_outcome",
+                "description": "Report the final result of this call to the office. Use ONCE per call as soon as the outcome is clear. Does NOT hang up the call.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "outcome": {"type": "string", "enum": ["booked", "declined", "no answer", "voicemail", "wrong number", "do not call", "callback", "failed"]},
+                        "slot_text": {"type": "string", "description": "When booked: the chosen slot copied exactly from the slot list, e.g. 'Tiago on 5 October at 12:00'"},
+                        "summary": {"type": "string", "description": "1-3 sentences: what the driver said, including any request for a human call-back"}
+                    },
+                    "required": ["outcome", "summary"]
+                }
             }],
             "tool_choice": "auto"
         }
