@@ -238,7 +238,7 @@ async def handle_media_stream(websocket: WebSocket):
             if the driver stays silent after nudges, she wraps up and hangs up.
             The watchdog NEVER fires while Emily is generating or playing audio or
             while the caller is speaking - a nudge must never talk over anyone."""
-            nonlocal inactivity_nudges, response_in_progress
+            nonlocal inactivity_nudges, response_in_progress, caller_speaking, last_activity_ts
             try:
                 while True:
                     await asyncio.sleep(1)
@@ -317,6 +317,7 @@ async def handle_media_stream(websocket: WebSocket):
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
             nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, response_in_progress, caller_speaking
+            nonlocal end_call_requested, end_call_requested_at, last_audio_out_at, outcome_reported
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -425,6 +426,7 @@ async def handle_media_stream(websocket: WebSocket):
             is sent, so wait for the stream to go quiet plus a drain margin.
             end_call can arrive while her closing sentence is still being
             generated, so also wait for any in-flight response to complete."""
+            nonlocal response_in_progress, end_call_requested_at, last_audio_out_at
             try:
                 while True:
                     await asyncio.sleep(0.5)
