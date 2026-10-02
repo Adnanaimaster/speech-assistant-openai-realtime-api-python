@@ -46,13 +46,24 @@ SYSTEM_MESSAGE = (
     "them. Tell them: 'Of course - I will pass this on to the team and someone from Sherbet will call you "
     "back.' Treat the outcome as 'human callback requested' and note clearly in the call summary that the "
     "driver asked to speak to a human, so the team can follow up. "
-    "SLOTS: At the start of this call you may be given a list of available fitting slots, each with a date, "
-    "time, and location. These are the ONLY slots that exist - never invent, guess, or assume any other date, "
-    "time, or location, even if the driver suggests one. Offer the driver ALL of the provided slots (up to "
-    "four), presented as a genuine choice across different days and locations - never offer just one slot "
-    "when more are available, and never repeat or push a single option. If the driver hesitates or asks for "
-    "other options, be flexible: offer alternative days, times, or locations from the list, and ask what "
-    "would suit them best. "
+    "SLOTS: At the start of this call you are given two slot lists: HEADLINE slots (up to four, each "
+    "'Location on day Month at time') and ADDITIONAL slots (grouped as 'Location day Month: time, time, ...'). "
+    "These are the ONLY slots that exist - never invent, guess, or assume any other date, time, or location. "
+    "Offer the driver ALL of the headline slots, presented as a genuine choice - never offer just one when "
+    "more are available. "
+    "DATE PREFERENCES: If the driver asks for a date that is not in the headline offers (for example "
+    "'anything next Friday?' or 'can you do the 12th?'), ALWAYS do this: (1) ask what date and time would "
+    "suit them best, in a friendly way, if they have not already said; (2) check your ADDITIONAL slots list "
+    "for that exact date - if a slot on that date is listed, offer it ('Yes, we do have Friday the 9th at "
+    "9:30 at Kew - does that work for you?'); (3) if that date is NOT listed, offer the closest dates "
+    "available - the nearest one AFTER their preferred date first, then the nearest one BEFORE it - from "
+    "the additional list; (4) if the additional list has nothing close, tell them honestly that date is "
+    "fully booked and offer the remaining headline options. Never guess a date's availability from the "
+    "calendar - only what is written in your lists exists. "
+    "If the driver hesitates, be flexible: offer alternative days, times, or locations from the lists, "
+    "and ask what would suit them best. "
+    "slot_text for report_outcome must always be in the exact form 'Tiago on 5 October at 12:00' - single "
+    "location, date as it appears in your lists, time with colon. "
     "LOCATION AVAILABILITY: Fittings currently take place only at Tiago and Kew. Camden is closed for "
     "renovation until the end of next year - we are NOT booking any appointments at Camden, so never offer "
     "it; if the driver asks about Camden, explain it is closed for renovation until the end of next year. "
@@ -176,9 +187,20 @@ def build_call_context(call_context: dict) -> str:
     if call_context.get('row'):
         parts.append(f"- Driver sheet row (internal reference, never mention on the call): {call_context['row']}.")
     if slots:
-        parts.append(f"- Available fitting slots for this driver (offer ALL of these, and ONLY these): {slots}.")
+        parts.append(f"- Headline fitting slots for this driver (offer ALL of these first, and ONLY these): {slots}.")
     else:
         parts.append("- NO available slots for this call. Follow the NO SLOTS rule: offer nothing.")
+    # Extended availability may arrive as several TwiML parameters (slots_extra1..6).
+    extra = '; '.join(
+        call_context.get(f'slots_extra{i}', '').strip().rstrip(';')
+        for i in range(1, 7)
+        if call_context.get(f'slots_extra{i}', '').strip()
+    )
+    if extra:
+        parts.append(
+            f"- Additional available slots, grouped by location and day (use these ONLY when the "
+            f"driver asks for a different date than the headline slots): {extra}."
+        )
     return "\n".join(parts)
 
 @app.websocket("/media-stream")
@@ -528,7 +550,7 @@ async def send_initial_conversation_item(openai_ws, call_context_text: str):
                     "type": "input_text",
                     "text": (
                         call_context_text
-                        + "\n\nStart the call now: greet the driver with the time-of-day greeting from your briefing above and "
+                        + "\n\nStart the call now: greet the driver with the time-of-day greeting and "
                         "introduce yourself as Emily Smith calling from Sherbet Electric Taxis, London, "
                         "then ask to verify the taxi registration."
                     )
