@@ -5,6 +5,11 @@ import asyncio
 import time
 import urllib.request
 import websockets
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -26,7 +31,8 @@ TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
 SYSTEM_MESSAGE = (
     "You are Emily Smith, a friendly and professional booking assistant calling on behalf of "
     "Sherbet Electric Taxis, London. You are making an outbound phone call to a London taxi driver. "
-    "Open the call with a time-of-day greeting (good morning, good afternoon, or good evening), then say: "
+    "Open the call with the exact time-of-day greeting given in your per-call briefing (good morning, "
+    "good afternoon, or good evening - use ONLY the one provided there), then say: "
     "'This is Emily Smith calling from Sherbet Electric Taxis, London.' "
     "First, verify the driver's identity: ask them to confirm they drive the taxi with the registration "
     "number given to you at the start of this call. If they confirm, continue. If they say the registration "
@@ -129,13 +135,34 @@ async def handle_incoming_call(request: Request):
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
+def london_greeting():
+    """Return the current Europe/London time-of-day greeting so Emily never
+    has to guess it (she has no clock and used to say good morning at 7pm)."""
+    try:
+        now = datetime.now(ZoneInfo('Europe/London')) if ZoneInfo else datetime.now()
+    except Exception:
+        now = datetime.now()
+    hour = now.hour
+    if 5 <= hour < 12:
+        period = 'good morning'
+    elif 12 <= hour < 17:
+        period = 'good afternoon'
+    else:
+        period = 'good evening'
+    return period, now.strftime('%A %d %B %Y at %H:%M')
+
 def build_call_context(call_context: dict) -> str:
     """Turn the per-call parameters into a briefing line for Emily."""
+    greeting, london_now = london_greeting()
     driver = call_context.get('driver', '').strip()
     reg = call_context.get('reg', '').strip()
     advert = call_context.get('advert', '').strip()
     slots = call_context.get('slots', '').strip()
     parts = ["Per-call details for this specific call (use these, never invent others):"]
+    parts.append(
+        f"- Local London time right now: {london_now}. The correct greeting for this call is "
+        f"'{greeting}' - use exactly this greeting word, never any other time-of-day word."
+    )
     if driver:
         parts.append(f"- Driver name: {driver}. Greet them by first name.")
     else:
@@ -501,7 +528,7 @@ async def send_initial_conversation_item(openai_ws, call_context_text: str):
                     "type": "input_text",
                     "text": (
                         call_context_text
-                        + "\n\nStart the call now: greet the driver with the time-of-day greeting and "
+                        + "\n\nStart the call now: greet the driver with the time-of-day greeting from your briefing above and "
                         "introduce yourself as Emily Smith calling from Sherbet Electric Taxis, London, "
                         "then ask to verify the taxi registration."
                     )
