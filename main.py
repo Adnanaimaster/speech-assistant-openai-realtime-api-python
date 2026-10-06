@@ -21,11 +21,10 @@ load_dotenv()
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
-# Where the workflow receives the call outcome once the call ends (test URL
-# until the workflow is published, then swap to the production /webhook/ URL).
+# Where the workflow receives the call outcome once the call ends.
 OUTCOME_WEBHOOK_URL = os.getenv(
     'OUTCOME_WEBHOOK_URL',
-    'https://adnanakhana.app.n8n.cloud/webhook-test/jackson-call-outcome'
+    'https://adnanakhana.app.n8n.cloud/webhook/emily-call-outcome'
 )
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
 SYSTEM_MESSAGE = (
@@ -237,6 +236,8 @@ async def handle_media_stream(websocket: WebSocket):
         end_call_requested = None      # call_id once Emily asks to hang up
         end_call_requested_at = None   # monotonic time of the request
         last_audio_out_at = None       # monotonic time of the last audio chunk sent to Twilio
+        end_call_mark_sent = False     # whether we sent the end_call mark to Twilio
+        end_call_mark_received = False # whether Twilio echoed the end_call mark back
         # Outcome reporting state: Emily calls report_outcome once the result is
         # clear; the transcript below is the safety net if she does not.
         outcome_reported = None        # dict of report_outcome arguments
@@ -333,6 +334,7 @@ async def handle_media_stream(websocket: WebSocket):
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
             nonlocal stream_sid, latest_media_timestamp, last_assistant_item, response_start_timestamp_twilio
+            nonlocal end_call_mark_received
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -355,6 +357,10 @@ async def handle_media_stream(websocket: WebSocket):
                             await initialize_session(openai_ws, build_call_context(call_context))
                             session_ready.set()
                     elif data['event'] == 'mark':
+                        mark_name = data.get('mark', {}).get('name', '')
+                        if mark_name == 'end_call':
+                            end_call_mark_received = True
+                            print("Twilio echoed end_call mark - audio finished playing")
                         if mark_queue:
                             mark_queue.pop(0)
             except WebSocketDisconnect:
@@ -366,7 +372,7 @@ async def handle_media_stream(websocket: WebSocket):
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
             nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, response_in_progress, caller_speaking
-            nonlocal end_call_requested, end_call_requested_at, last_audio_out_at, outcome_reported
+            nonlocal end_call_requested, end_call_requested_at, last_audio_out_at, outcome_reported, end_call_mark_sent
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -412,6 +418,19 @@ async def handle_media_stream(websocket: WebSocket):
                     if response.get('type') == 'response.done':
                         response_in_progress = False
                         note_activity()
+                        # If Emily already asked to hang up, send the end_call mark
+                        # now - Twilio will echo it once all queued audio has played.
+                        if end_call_requested is not None and not end_call_mark_sent:
+                            end_call_mark_sent = True
+                            print("Sending end_call mark to Twilio (audio queue ends here)")
+                            try:
+                                await websocket.send_json({
+                                    "event": "mark",
+                                    "streamSid": stream_sid,
+                                    "mark": {"name": "end_call"}
+                                })
+                            except Exception as e:
+                                print(f"Failed to send end_call mark: {e}")
                         for out_item in (response.get('response', {}).get('output') or []):
                             if out_item.get('type') == 'function_call' and out_item.get('name') == 'report_outcome':
                                 try:
@@ -470,23 +489,28 @@ async def handle_media_stream(websocket: WebSocket):
                 print(f"Error in send_to_twilio: {e}")
 
         async def hangup_watcher():
-            """Close the Twilio line only after Emily's final audio has finished
-            playing on the call. Audio reaches the caller ~150ms after each chunk
-            is sent, so wait for the stream to go quiet plus a drain margin.
-            end_call can arrive while her closing sentence is still being
-            generated, so also wait for any in-flight response to complete."""
-            nonlocal response_in_progress, end_call_requested_at, last_audio_out_at
+            """Close the Twilio line only after Emily's final audio has actually
+            finished playing. Instead of guessing with a quiet period, we send a
+            Twilio 'mark' event after Emily's last audio chunk; Twilio echoes it
+            back once that audio has been played to the caller. Only then hang up.
+            Safety cap: 120 seconds in case the mark echo is lost."""
+            nonlocal response_in_progress, end_call_requested_at, end_call_mark_received, end_call_mark_sent
             try:
                 while True:
                     await asyncio.sleep(0.5)
                     if end_call_requested_at is None:
                         continue
                     waited = time.monotonic() - end_call_requested_at
-                    if response_in_progress:
-                        continue  # closing sentence still being generated/played
-                    quiet_for = time.monotonic() - last_audio_out_at if last_audio_out_at else 999
-                    if quiet_for >= 3.0 or waited >= 30.0:
-                        print(f"Hanging up now: audio drained (quiet {quiet_for:.1f}s, waited {waited:.1f}s)")
+                    if end_call_mark_received:
+                        print(f"Hanging up now: end_call mark echoed back by Twilio (waited {waited:.1f}s)")
+                        try:
+                            await websocket.close()
+                        except Exception:
+                            pass
+                        await send_call_outcome('hangup')
+                        return
+                    if waited >= 120.0:
+                        print(f"Hanging up now: safety cap reached (waited {waited:.1f}s, mark never echoed)")
                         try:
                             await websocket.close()
                         except Exception:
